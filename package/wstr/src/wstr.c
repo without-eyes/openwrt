@@ -24,6 +24,37 @@
 #define DOMAIN_NAME_SIZE 128
 #define ERROR_MESSAGE_SIZE 256
 
+void wstr(const struct Options* options) {
+    const int socketFileDescriptor = create_socket(options);
+    const struct sockaddr_in destinationAddress = resolve_host(options->destinationHost);
+    struct icmp icmpHeader;
+
+    for (uint8_t timeToLive = 1; timeToLive <= options->maxTimeToLive; timeToLive++) {
+        struct timespec sendingTime, receivingTime;
+        struct sockaddr_in replyAddress;
+        char packet[PACKET_SIZE];
+
+        set_icmp_echo_fields(&icmpHeader, timeToLive);
+        set_socket_ttl(socketFileDescriptor, timeToLive);
+        set_socket_timeout(options, socketFileDescriptor);
+
+        clock_gettime(CLOCK_MONOTONIC, &sendingTime);
+        send_icmp_packet(socketFileDescriptor, &icmpHeader, &destinationAddress, timeToLive);
+        receive_icmp_packet(socketFileDescriptor, packet, &replyAddress);
+        clock_gettime(CLOCK_MONOTONIC, &receivingTime);
+
+        if (is_valid_icmp_reply(packet)) {
+            print_hop_info(options, timeToLive, calculate_round_trip_time(sendingTime, receivingTime), &replyAddress);
+        }
+
+        if (replyAddress.sin_addr.s_addr == destinationAddress.sin_addr.s_addr) {
+            break;
+        }
+    }
+
+    close(socketFileDescriptor);
+}
+
 struct Options parse_arguments(const uint8_t argc, char *argv[]) {
     int currentOption;
     struct Options options = {
@@ -81,7 +112,7 @@ struct Options parse_arguments(const uint8_t argc, char *argv[]) {
             break;
 
         case 'h': // help
-            printf("Usage: sudo wstr [-d] [-i name] [-t number] destination\n");
+            printf("Usage: sudo wstr [-d] [-i interface] [-t ttl] [-o timeout] destination\n");
             printf("  -d, --domain      Turn on displaying FQDN\n");
             printf("  -i, --interface   Set network interface\n");
             printf("  -t, --ttl         Set TTL(0-255) for network packets\n");
@@ -102,26 +133,75 @@ struct Options parse_arguments(const uint8_t argc, char *argv[]) {
     return options;
 }
 
+void handle_error(const uint8_t exitFlag, const char *message, ...) {
+    char errorMessage[ERROR_MESSAGE_SIZE];
+    strncpy(errorMessage, "Error: ", ERROR_MESSAGE_SIZE - 1);
+    strncat(errorMessage, message, ERROR_MESSAGE_SIZE - strlen(errorMessage) - 1);
+
+    const char* strerrorResult = strerror(errno);
+    if (strcmp(strerrorResult, "Success") != 0) {
+        strncat(errorMessage, ". Reason: ", ERROR_MESSAGE_SIZE - strlen(errorMessage) - 1);
+        strncat(errorMessage, strerrorResult, ERROR_MESSAGE_SIZE - strlen(errorMessage) - 1);
+    }
+    strncat(errorMessage, "\n", ERROR_MESSAGE_SIZE - strlen(errorMessage) - 1);
+
+    va_list arg;
+    va_start(arg, message);
+    vfprintf(stdout, errorMessage, arg);
+    va_end(arg);
+
+    if (exitFlag) {
+        exit(EXIT_FAILURE);
+    }
+}
+
+int create_socket(const struct Options *options) {
+    const int socketFileDescriptor = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (socketFileDescriptor == -1) {
+        handle_error(1, "Socket creation failed");
+    }
+
+    if (options->interface != NULL &&
+        setsockopt(socketFileDescriptor, SOL_SOCKET, SO_BINDTODEVICE, options->interface,
+                    sizeof(options->interface)) == -1) {
+        handle_error(1, "Failed to bind socket to interface '%s'", options->interface);
+    }
+
+    return socketFileDescriptor;
+}
+
 struct sockaddr_in resolve_host(const char *destinationHost) {
-    struct addrinfo hints = {0}, *res;
+    struct addrinfo hints = {0}, *result;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
 
-    if (getaddrinfo(destinationHost, NULL, &hints, &res) != 0) {
+    if (getaddrinfo(destinationHost, NULL, &hints, &result) != 0) {
         handle_error(1, "Failed to resolve host");
     }
 
-    if (res == NULL) {
+    if (result == NULL) {
         handle_error(1, "No valid address found for host %s", destinationHost);
     }
 
-    const struct sockaddr_in destinationAddress = *(struct sockaddr_in *)res->ai_addr;
-    freeaddrinfo(res);
+    const struct sockaddr_in destinationAddress = *(struct sockaddr_in *)result->ai_addr;
+    freeaddrinfo(result);
 
     return destinationAddress;
 }
 
-uint32_t calculate_checksum(void *buffer, uint16_t length) {
+void set_icmp_echo_fields(struct icmp* icmpHeader, const uint8_t timeToLive) {
+    if (icmpHeader == NULL) {
+        handle_error(1, "ICMP header pointer is NULL");
+    }
+    memset(icmpHeader, 0, sizeof(*icmpHeader));
+    icmpHeader->icmp_type = ICMP_ECHO;
+    icmpHeader->icmp_code = 0;
+    icmpHeader->icmp_id = (uint16_t)getpid();
+    icmpHeader->icmp_seq = timeToLive;
+    icmpHeader->icmp_cksum = calculate_checksum(icmpHeader, sizeof(*icmpHeader));
+}
+
+uint16_t calculate_checksum(void *buffer, uint16_t length) {
     uint16_t *wordPointer = buffer;
     uint32_t sum = 0;
 
@@ -136,19 +216,52 @@ uint32_t calculate_checksum(void *buffer, uint16_t length) {
     sum = (sum >> WORD_LENGTH_IN_BYTES) + (sum & 0xFFFF);
     sum += sum >> WORD_LENGTH_IN_BYTES;
 
-    return ~sum;
+    return (uint16_t)~sum;
 }
 
-void set_icmp_echo_fields(struct icmp* icmpHeader, const uint8_t timeToLive) {
-    if (icmpHeader == NULL) {
-        handle_error(1, "ICMP header pointer is NULL");
+void set_socket_ttl(const int socketFileDescriptor, const uint8_t timeToLive) {
+    if (setsockopt(socketFileDescriptor, IPPROTO_IP, IP_TTL, &timeToLive,
+                sizeof(timeToLive)) == -1) {
+        handle_error(1, "Failed to set TTL (setsockopt)");
+                }
+}
+
+void set_socket_timeout(const struct Options* options, const int socketFileDescriptor) {
+    const struct timespec timeout = {options->timeout, 0};
+    if (setsockopt(socketFileDescriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == -1) {
+        handle_error(1, "Failed to set socket receive timeout");
     }
-    memset(icmpHeader, 0, sizeof(*icmpHeader));
-    icmpHeader->icmp_type = ICMP_ECHO;
-    icmpHeader->icmp_code = 0;
-    icmpHeader->icmp_id = (uint16_t)getpid();
-    icmpHeader->icmp_seq = timeToLive;
-    icmpHeader->icmp_cksum = (uint16_t)calculate_checksum(icmpHeader, sizeof(*icmpHeader));
+}
+
+void send_icmp_packet(const int socketFileDescriptor, const struct icmp *icmpHeader,
+    const struct sockaddr_in *destinationAddress, const uint8_t timeToLive) {
+    if (sendto(socketFileDescriptor, icmpHeader, sizeof(*icmpHeader), 0,
+                (struct sockaddr *)destinationAddress, sizeof(*destinationAddress)) == -1) {
+        handle_error(1, "Packet send failed (sendto). Destination: %s, TTL: %d",
+                      inet_ntoa(destinationAddress->sin_addr), timeToLive);
+    }
+}
+
+void receive_icmp_packet(const int socketFileDescriptor, char *packet, struct sockaddr_in *replyAddress) {
+    socklen_t addrLen = sizeof(*replyAddress);
+    if (recvfrom(socketFileDescriptor, packet, PACKET_SIZE, 0, (struct sockaddr *)replyAddress,
+                  &addrLen) == -1) {
+        handle_error(1, "Packet receive failed (recvfrom)");
+    }
+}
+
+uint8_t is_valid_icmp_reply(const char *packet) {
+    const struct ip *ipHeader = (const struct ip *)packet;
+    if (ipHeader->ip_p != IPPROTO_ICMP) {
+        handle_error(0, "Unexpected protocol %d. Expected ICMP.", ipHeader->ip_p);
+        return 0;
+    }
+
+    if (ipHeader->ip_src.s_addr == htonl(INADDR_LOOPBACK)) {
+        return 0;
+    }
+
+    return 1;
 }
 
 void print_hop_info(const struct Options *options, const uint8_t timeToLive, const double roundTripTime,
@@ -172,120 +285,4 @@ void print_hop_info(const struct Options *options, const uint8_t timeToLive, con
 double calculate_round_trip_time(const struct timespec sendingTime, const struct timespec receivingTime) {
     return (double)(receivingTime.tv_sec - sendingTime.tv_sec) * 1000.0 +
             (double)(receivingTime.tv_nsec - sendingTime.tv_nsec) / 1000000.0;
-}
-
-int create_socket(const struct Options *options) {
-    const int socketFileDescriptor = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-    if (socketFileDescriptor == -1) {
-        handle_error(1, "Socket creation failed");
-    }
-
-    if (options->interface != NULL &&
-        setsockopt(socketFileDescriptor, SOL_SOCKET, SO_BINDTODEVICE, options->interface,
-                    sizeof(options->interface)) == -1) {
-        handle_error(1, "Failed to bind socket to interface '%s'", options->interface);
-    }
-
-    return socketFileDescriptor;
-}
-
-void handle_error(const uint8_t exitFlag, const char *message, ...) {
-    char errorMessage[ERROR_MESSAGE_SIZE];
-    strcpy(errorMessage, "Error: ");
-    strcat(errorMessage, message);
-
-    const char* strerrorResult = strerror(errno);
-    if (strcmp(strerrorResult, "Success") != 0) {
-        strcat(errorMessage, ". Reason: ");
-        strcat(errorMessage, strerrorResult);
-    }
-    strcat(errorMessage, "\n");
-
-    va_list arg;
-    va_start(arg, message);
-    vfprintf(stdout, errorMessage, arg);
-    va_end(arg);
-
-    if (exitFlag) {
-        exit(EXIT_FAILURE);
-    }
-}
-
-void set_socket_ttl(const int socketFileDescriptor, const uint8_t timeToLive) {
-    if (setsockopt(socketFileDescriptor, IPPROTO_IP, IP_TTL, &timeToLive,
-                sizeof(timeToLive)) == -1) {
-        handle_error(1, "Failed to set TTL (setsockopt)");
-    }
-}
-
-void send_icmp_packet(const int socketFileDescriptor, const struct icmp *icmpHeader,
-                      const struct sockaddr_in *destinationAddress, const uint8_t timeToLive) {
-    if (sendto(socketFileDescriptor, icmpHeader, sizeof(*icmpHeader), 0,
-                (struct sockaddr *)destinationAddress, sizeof(*destinationAddress)) == -1) {
-        handle_error(1, "Packet send failed (sendto). Destination: %s, TTL: %d",
-                      inet_ntoa(destinationAddress->sin_addr), timeToLive);
-    }
-}
-
-void receive_icmp_packet(const int socketFileDescriptor, char *packet, struct sockaddr_in *replyAddr) {
-    socklen_t addrLen = sizeof(*replyAddr);
-    if (recvfrom(socketFileDescriptor, packet, PACKET_SIZE, 0, (struct sockaddr *)replyAddr,
-                  &addrLen) == -1) {
-        handle_error(1, "Packet receive failed (recvfrom)");
-    }
-}
-
-uint8_t is_valid_icmp_reply(const char *packet) {
-    const struct ip *ipHeader = (const struct ip *)packet;
-    if (ipHeader->ip_p != IPPROTO_ICMP) {
-        handle_error(0, "Unexpected protocol %d. Expected ICMP.", ipHeader->ip_p);
-        return 0;
-    }
-
-    const struct icmp *icmpReply = (const struct icmp *)(packet + (ipHeader->ip_hl << 2));
-    if (icmpReply->icmp_type != ICMP_ECHOREPLY && icmpReply->icmp_type != ICMP_TIME_EXCEEDED) {
-        handle_error(0, "Unexpected ICMP type %d", icmpReply->icmp_type);
-        return 0;
-    }
-
-    return 1;
-}
-
-void set_socket_timeout(const struct Options* options, const int socketFileDescriptor) {
-    const struct timespec timeout = {options->timeout, 0};
-    if (setsockopt(socketFileDescriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == -1) {
-        handle_error(1, "Failed to set socket receive timeout");
-    }
-}
-
-void wstr(const struct Options* options) {
-    const int socketFileDescriptor = create_socket(options);
-
-    const struct sockaddr_in destinationAddress = resolve_host(options->destinationHost);
-
-    struct icmp icmpHeader;
-    for (uint8_t timeToLive = 1; timeToLive <= options->maxTimeToLive; timeToLive++) {
-        struct timespec sendingTime, receivingTime;
-        struct sockaddr_in replyAddress;
-        char packet[PACKET_SIZE];
-
-        set_icmp_echo_fields(&icmpHeader, timeToLive);
-
-        clock_gettime(CLOCK_MONOTONIC, &sendingTime);
-        set_socket_ttl(socketFileDescriptor, timeToLive);
-        set_socket_timeout(options, socketFileDescriptor);
-        send_icmp_packet(socketFileDescriptor, &icmpHeader, &destinationAddress, timeToLive);
-        receive_icmp_packet(socketFileDescriptor, packet, &replyAddress);
-        clock_gettime(CLOCK_MONOTONIC, &receivingTime);
-
-        if (is_valid_icmp_reply(packet)) {
-            print_hop_info(options, timeToLive, calculate_round_trip_time(sendingTime, receivingTime), &replyAddress);
-        }
-
-        if (replyAddress.sin_addr.s_addr == destinationAddress.sin_addr.s_addr) {
-            break;
-        }
-    }
-
-    close(socketFileDescriptor);
 }
